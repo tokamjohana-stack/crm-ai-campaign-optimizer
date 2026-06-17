@@ -8,9 +8,15 @@ Usage :
   python -m streamlit run app.py
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import joblib
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
 
 # ══════════════════════════════════════════════
 # CONFIGURATION PAGE
@@ -23,18 +29,115 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════
-# CHARGEMENT DES MODÈLES (une seule fois)
+# CONFIGURATION FEATURES & MODÈLES
+# ══════════════════════════════════════════════
+
+TARGETS = ["open_rate", "click_rate", "conversion_rate"]
+
+CATEGORICAL_FEATURES = [
+    "campaign_type", "offer_type", "audience_segment",
+    "device_main", "send_day", "subject_sentiment",
+]
+NUMERICAL_FEATURES = [
+    "send_hour", "subject_length", "has_personalization",
+    "is_urgent", "has_image", "nb_links", "cta_count",
+    "audience_size", "marketing_pressure",
+    "previous_segment_open_rate", "previous_segment_ctr",
+]
+ALL_FEATURES = CATEGORICAL_FEATURES + NUMERICAL_FEATURES
+
+SCORE_WEIGHTS = {
+    "open_rate": 0.35,
+    "click_rate": 0.35,
+    "conversion_rate": 0.30,
+}
+
+# ══════════════════════════════════════════════
+# ENTRAÎNEMENT À LA VOLÉE (si modèles absents)
 # ══════════════════════════════════════════════
 
 @st.cache_resource
 def load_models():
-    models = {
-        "open_rate":       joblib.load("models/model_open_rate.joblib"),
-        "click_rate":      joblib.load("models/model_click_rate.joblib"),
-        "conversion_rate": joblib.load("models/model_conversion_rate.joblib"),
-    }
-    benchmarks = joblib.load("models/benchmarks.joblib")
-    insights   = joblib.load("models/insights.joblib")
+    """
+    Charge les modèles depuis le disque si disponibles,
+    sinon les entraîne à la volée depuis le CSV.
+    """
+    models_dir = "models"
+    model_path = os.path.join(models_dir, "model_open_rate.joblib")
+
+    # Cas 1 : modèles déjà présents sur disque
+    if os.path.exists(model_path):
+        models = {
+            t: joblib.load(os.path.join(models_dir, f"model_{t}.joblib"))
+            for t in TARGETS
+        }
+        benchmarks = joblib.load(os.path.join(models_dir, "benchmarks.joblib"))
+        insights   = joblib.load(os.path.join(models_dir, "insights.joblib"))
+        return models, benchmarks, insights
+
+    # Cas 2 : entraînement à la volée (Streamlit Cloud)
+    with st.spinner("⚙️ Initialisation des modèles IA... (environ 60 secondes)"):
+        df = pd.read_csv("crm_email_campaigns_synthetic_5000.csv")
+        X  = df[ALL_FEATURES]
+
+        preprocessor = ColumnTransformer(transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEGORICAL_FEATURES),
+            ("num", "passthrough", NUMERICAL_FEATURES),
+        ])
+
+        models = {}
+        for target in TARGETS:
+            y = df[target]
+            X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+            pipeline = Pipeline(steps=[
+                ("preprocessor", preprocessor),
+                ("model", RandomForestRegressor(
+                    n_estimators=200, max_depth=12,
+                    min_samples_leaf=5, random_state=42, n_jobs=-1,
+                )),
+            ])
+            pipeline.fit(X_train, y_train)
+            models[target] = pipeline
+
+        # Benchmarks
+        benchmarks = {}
+        for target in TARGETS:
+            benchmarks[target] = {
+                "min":  round(df[target].min(),  4),
+                "mean": round(df[target].mean(), 4),
+                "max":  round(df[target].max(),  4),
+            }
+        benchmarks["weights"] = SCORE_WEIGHTS
+
+        # Insights
+        segment_perf  = df.groupby("audience_segment")["open_rate"].mean().sort_values(ascending=False)
+        day_perf      = df.groupby("send_day")["open_rate"].mean().sort_values(ascending=False)
+        campaign_perf = df.groupby("campaign_type")["open_rate"].mean().sort_values(ascending=False)
+        perso_perf    = df.groupby("has_personalization")["open_rate"].mean()
+        perso_diff    = perso_perf.get(1, 0) - perso_perf.get(0, 0)
+        low_p  = df[df["marketing_pressure"] <= 2]["open_rate"].mean()
+        high_p = df[df["marketing_pressure"] >= 5]["open_rate"].mean()
+
+        def subject_bucket(l):
+            if l < 30:    return "court (<30 car.)"
+            elif l <= 50: return "moyen (30-50 car.)"
+            else:         return "long (>50 car.)"
+
+        df["subject_bucket"] = df["subject_length"].apply(subject_bucket)
+        subj_perf = df.groupby("subject_bucket")["open_rate"].mean().sort_values(ascending=False)
+        seg_conv  = df.groupby("audience_segment")["conversion_rate"].mean().sort_values(ascending=False)
+
+        insights = {
+            "best_segment": {"metric_value": round(segment_perf.max(), 4), "recommendation": f"Priorisez les campagnes sur les '{segment_perf.idxmax()}' : open rate moyen de {segment_perf.max():.1%}, soit +{(segment_perf.max() - segment_perf.mean()):.1%} vs moyenne."},
+            "worst_segment": {"metric_value": round(segment_perf.min(), 4), "recommendation": f"Les '{segment_perf.idxmin()}' sous-performent ({segment_perf.min():.1%} d'open rate). Utilisez des campagnes de réactivation dédiées avec une offre forte."},
+            "best_day": {"metric_value": round(day_perf.max(), 4), "recommendation": f"Le meilleur jour d'envoi est le {day_perf.idxmax()} ({day_perf.max():.1%} d'open rate). Evitez le {day_perf.idxmin()} ({day_perf.min():.1%})."},
+            "best_campaign_type": {"metric_value": round(campaign_perf.max(), 4), "recommendation": f"Les campagnes '{campaign_perf.idxmax()}' sont les plus performantes ({campaign_perf.max():.1%} d'open rate)."},
+            "personalization": {"metric_value": round(perso_diff, 4), "recommendation": f"La personnalisation améliore l'open rate de {perso_diff:.1%} en moyenne. C'est un levier simple à activer systématiquement."},
+            "marketing_pressure": {"metric_value": round(low_p - high_p, 4), "recommendation": f"Une faible pression marketing (<=2) surperforme une forte pression (>=5) de {(low_p - high_p):.1%} en open rate. Espacez vos envois."},
+            "subject_length": {"metric_value": round(subj_perf.max(), 4), "recommendation": f"Les objets '{subj_perf.idxmax()}' obtiennent le meilleur open rate ({subj_perf.max():.1%}). Evitez les objets trop longs qui se tronquent sur mobile."},
+            "conversion_by_segment": {"metric_value": round(seg_conv.max(), 4), "recommendation": f"En conversion, le segment '{seg_conv.idxmax()}' est aussi le plus performant ({seg_conv.max():.1%}). Concentrez vos offres à forte valeur sur ce segment."},
+        }
+
     return models, benchmarks, insights
 
 models, benchmarks, insights = load_models()
